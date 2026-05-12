@@ -150,10 +150,13 @@ async def main() -> None:
         _LOGGER.error(f"Failed to load Microsoft STT model: {e}")
         return
 
+    # Prime Azure SDK TLS/auth caches before accepting connections so the
+    # first user request doesn't pay handshake latency.
+    await stt_model.warmup()
+
     # Initialize server and run
     server = AsyncServer.from_uri(args.uri)
     _LOGGER.info("Ready")
-    model_lock = asyncio.Lock()
     try:
         await server.run(
             partial(
@@ -161,7 +164,6 @@ async def main() -> None:
                 wyoming_info,
                 args,
                 stt_model,
-                model_lock,
             )
         )
     except Exception as e:

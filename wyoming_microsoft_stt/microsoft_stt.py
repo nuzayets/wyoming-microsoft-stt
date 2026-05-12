@@ -1,48 +1,29 @@
 """Microsoft STT module for Wyoming."""
 
-import time
-import azure.cognitiveservices.speech as speechsdk  # noqa: D100
+import asyncio
+import contextlib
 import logging
+
+import azure.cognitiveservices.speech as speechsdk
+
 from . import SpeechConfig
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class MicrosoftSTT:
-    """Class to handle Microsoft STT."""
+class RecognitionSession:
+    """One transcription: push audio, await final transcript."""
 
-    def __init__(self, speechconfig: SpeechConfig) -> None:
-        """Initialize."""
-        self.args = speechconfig
-
-        self._stream: speechsdk.audio.PushAudioInputStream | None = None
-        self._speech_recognizer: speechsdk.SpeechRecognizer | None = None
-        self._results: speechsdk.SpeechRecognitionResult | None = None
-
-        try:
-            # Initialize the speech configuration with the provided subscription key and region
-            self.speech_config = speechsdk.SpeechConfig(
-                subscription=self.args.subscription_key, region=self.args.service_region
-            )
-            _LOGGER.info("Microsoft SpeechConfig initialized successfully.")
-        except Exception as e:
-            _LOGGER.error(f"Failed to initialize Microsoft SpeechConfig: {e}")
-            raise
-
-        self.set_profanity(self.args.profanity)
-
-    def start_transcribe(
+    def __init__(
         self,
-        samples_per_second: int = 16000,
-        bits_per_sample: int = 16,
-        channels: int = 1,
-        language=None,
+        speech_config: speechsdk.SpeechConfig,
+        samples_per_second: int,
+        bits_per_sample: int,
+        channels: int,
+        language_kwargs: dict,
     ) -> None:
-        """Begin a transcription."""
-        _LOGGER.debug(f"Starting transcription with language: {language}")
-
-        # Configure audio input for speech recognition
-        _LOGGER.debug("Configuring audio input stream...")
+        """Build the recognizer + push stream for a single utterance."""
+        self._loop = asyncio.get_running_loop()
         self._stream = speechsdk.audio.PushAudioInputStream(
             stream_format=speechsdk.audio.AudioStreamFormat(
                 samples_per_second=samples_per_second,
@@ -51,77 +32,138 @@ class MicrosoftSTT:
             )
         )
         audio_config = speechsdk.audio.AudioConfig(stream=self._stream)
-        # Create a speech recognizer with the configured speech and audio settings
-        self._speech_recognizer = speechsdk.SpeechRecognizer(
-            speech_config=self.speech_config,
+        self._recognizer = speechsdk.SpeechRecognizer(
+            speech_config=speech_config,
             audio_config=audio_config,
-            **self.get_language(language),
+            **language_kwargs,
         )
+        self._session_stopped = asyncio.Event()
+        self._last_text: str = ""
+        self._error: Exception | None = None
+        self._started = False
+        self._finished = False
 
-        self.recognition_done = False
+        self._recognizer.recognized.connect(self._on_recognized)
+        self._recognizer.session_stopped.connect(self._on_session_stopped)
+        self._recognizer.canceled.connect(self._on_canceled)
 
-        def session_stopped_cb(evt):
-            """Signal to stop continuous recognition upon receiving an event `evt`."""
-            _LOGGER.debug(f"SESSION STOPPED: {evt}")
-            self.recognition_done = True
+    def _on_recognized(self, evt) -> None:
+        _LOGGER.debug("RECOGNIZED: %s", evt.result)
+        if evt.result.text:
+            self._last_text = evt.result.text
 
-        self._speech_recognizer.recognizing.connect(
-            lambda evt: _LOGGER.debug(f"RECOGNIZING: {evt}")
-        )
-        self._speech_recognizer.recognized.connect(
-            lambda evt: _LOGGER.debug(f"RECOGNIZED: {evt}")
-        )
-        self._speech_recognizer.session_started.connect(
-            lambda evt: _LOGGER.debug(f"SESSION STARTED: {evt}")
-        )
-        self._speech_recognizer.session_stopped.connect(session_stopped_cb)
-        self._speech_recognizer.canceled.connect(
-            lambda evt: _LOGGER.debug(f"CANCELED {evt}")
-        )
+    def _on_session_stopped(self, evt) -> None:
+        _LOGGER.debug("SESSION STOPPED: %s", evt)
+        self._loop.call_soon_threadsafe(self._session_stopped.set)
 
-        _LOGGER.debug("Starting continuous recognition...")
+    def _on_canceled(self, evt) -> None:
+        _LOGGER.debug("CANCELED: %s", evt)
+        details = evt.result.cancellation_details
+        if details.reason == speechsdk.CancellationReason.Error:
+            self._error = RuntimeError(
+                f"Azure STT canceled: {details.error_details}"
+            )
+        self._loop.call_soon_threadsafe(self._session_stopped.set)
 
-        def recognized(event: speechsdk.SpeechRecognitionEventArgs):
-            _LOGGER.debug(f"{event.result}")
-            self._results = event.result
+    def start(self) -> None:
+        """Begin recognition.
 
-        self._speech_recognizer.recognized.connect(recognized)
-        self._speech_recognizer.start_continuous_recognition_async()
+        Fire-and-forget — the SDK buffers pushed audio until the session
+        is established.
+        """
+        self._recognizer.start_continuous_recognition_async()
+        self._started = True
 
-    def push_audio_chunk(self, chunk: bytes) -> None:
-        """Push an audio chunk to the recognizer."""
-        _LOGGER.debug(f"Pushing audio chunk of size {len(chunk)} bytes...")
+    def push_chunk(self, chunk: bytes) -> None:
+        """Push a chunk of audio bytes into the recognition stream."""
         self._stream.write(chunk)
 
-    def stop_audio_chunk(self) -> None:
-        """Stop the transcription."""
-        _LOGGER.debug("Stopping transcription...")
+    async def finish(self) -> str:
+        """Close the audio stream, await final transcript."""
+        if self._finished:
+            return self._last_text
+        self._finished = True
         self._stream.close()
+        await self._session_stopped.wait()
+        stop_future = self._recognizer.stop_continuous_recognition_async()
+        await self._loop.run_in_executor(None, stop_future.get)
+        if self._error:
+            raise self._error
+        return self._last_text
 
-    def transcribe(self):
-        """Get the results of a transcription."""
+
+class MicrosoftSTT:
+    """Holds shared SpeechConfig and produces per-utterance sessions."""
+
+    def __init__(self, speechconfig: SpeechConfig) -> None:
+        """Initialize."""
+        self.args = speechconfig
+
         try:
-            self.stop_audio_chunk()
-
-            # Wait for the recognition to finish
-            while not self.recognition_done:
-                time.sleep(0.01)
-
-            out_future = self._speech_recognizer.stop_continuous_recognition_async()
-
-            out = out_future.get()
-
-            _LOGGER.debug(f"Transcription stopped, result: {out}")
-
-            if self._results is None:
-                _LOGGER.debug("No results from transcription.")
-                return ""
-
-            return self._results.text
-
+            self.speech_config = speechsdk.SpeechConfig(
+                subscription=self.args.subscription_key,
+                region=self.args.service_region,
+            )
+            _LOGGER.info("Microsoft SpeechConfig initialized successfully.")
         except Exception as e:
-            _LOGGER.error(f"Failed to transcribe audio: {e}")
-            return ""
+            _LOGGER.error(f"Failed to initialize Microsoft SpeechConfig: {e}")
+            raise
+
+        self.set_profanity(self.args.profanity)
+
+    def new_session(
+        self,
+        samples_per_second: int = 16000,
+        bits_per_sample: int = 16,
+        channels: int = 1,
+        language: str | None = None,
+    ) -> RecognitionSession:
+        """Create a fresh RecognitionSession for a single utterance."""
+        return RecognitionSession(
+            speech_config=self.speech_config,
+            samples_per_second=samples_per_second,
+            bits_per_sample=bits_per_sample,
+            channels=channels,
+            language_kwargs=self.get_language(language),
+        )
+
+    async def warmup(self) -> None:
+        """Open a throwaway connection to prime SDK TLS/auth caches.
+
+        The Azure SDK caches auth state globally, so warming one
+        recognizer reduces TTFB for subsequent fresh ones.
+        """
+        loop = asyncio.get_running_loop()
+        stream = speechsdk.audio.PushAudioInputStream(
+            stream_format=speechsdk.audio.AudioStreamFormat(
+                samples_per_second=16000, bits_per_sample=16, channels=1
+            )
+        )
+        try:
+            audio_config = speechsdk.audio.AudioConfig(stream=stream)
+            recognizer = speechsdk.SpeechRecognizer(
+                speech_config=self.speech_config,
+                audio_config=audio_config,
+                **self.get_language(None),
+            )
+            connection = speechsdk.Connection.from_recognizer(recognizer)
+            connected = asyncio.Event()
+            connection.connected.connect(
+                lambda evt: loop.call_soon_threadsafe(connected.set)
+            )
+            connection.open(True)
+            try:
+                await asyncio.wait_for(connected.wait(), timeout=5.0)
+                _LOGGER.info("Azure STT warmed up")
+            except TimeoutError:
+                _LOGGER.warning("Azure STT warmup did not complete in 5s")
+            with contextlib.suppress(Exception):
+                connection.close()
+        except Exception as e:
+            _LOGGER.warning("Azure STT warmup failed: %s", e)
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
 
     def get_language(self, language: None | str) -> dict:
         """Get the language code."""
